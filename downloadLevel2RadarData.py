@@ -90,16 +90,20 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
    filteredFiles = [info["name"] for epoch in tqdm(epochTime, file = sys.__stdout__)
                     for info in fileInfo[np.where(radars == epoch["radar"])[0]]
                     if (epoch["start"] <= info["time"] <= epoch["end"])] 
-      
+   
+   filteredFiles.sort()
+   
+   filteredDates = list(set([file[file.rfind('/') + 5:file.rfind('/') + 13] + '/' + file[file.rfind('/') + 1:file.rfind('/') + 5] for file in filteredFiles]))
+
    ## Make set of existing radar files in specified output directory for skipping downloading existing files
-   print("Finding exisiting files (this might take a little while "
-         "[without a progress bar] if you have many files in your output directory):", flush = True)
+   print("Finding exisiting files:", flush = True)
    existingFiles = set([item[item.rfind('/') + 5:item.rfind('/') + 9] + '/' +
                         item[item.rfind('/') + 9:item.rfind('/') + 11] + '/' +
                         item[item.rfind('/') + 11:item.rfind('/') + 13] + '/' +
                         item[item.rfind('/') + 1:item.rfind('/') + 5] + '/' +
                         item[item.rfind('/') + 1:]
-                        for item in tqdm(glob(outputDir + "/*/*/raw/*"), file = sys.__stdout__)])
+                        for d in tqdm(filteredDates, file = sys.__stdout__)
+                        for item in glob(outputDir + "/{}/raw/*".format(d))])
      
    # Filtering out files that are already in output directory
    filesToDownload = np.array(list(set(filteredFiles) - existingFiles))
