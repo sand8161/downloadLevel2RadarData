@@ -12,9 +12,10 @@ from shapely.geometry import polygon, Point
 from tqdm import tqdm
 
 def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDates = [],
-         inputFile = '', printFileList = False, radars = [], radarName = "radar", 
-         timeStampName = "timestamp", timeThreshold = 300, domains = [], radarFile = '',
-         latName = '', lonName = '', radarCol = ''):   
+         inputFile = '', copyST = False, copyNRE = False, printFileList = False,
+         radars = [], radarName = "radar", timeStampName = "timestamp",
+         startTimeName = "startDate", endTimeName = "endDate", timeThreshold = 300,
+         domains = [], radarFile = '', latName = '', lonName = '', radarCol = ''):   
    if not path.exists(outputDir):
       print("Output directory {} does not exist. Creating directory.".format(outputDir), flush = True)
       system("mkdir -p {}".format(outputDir))      
@@ -29,6 +30,8 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
             print("No list of radars supplied. Please provide a CSV with radar lats and lons.", flush = True)
             exit()
          radars = getRadarListFromDomain(domains, radarFile, latName, lonName, radarCol)
+         print("Radars in domain:")
+         print(radars)
       if (len(startDates) == 0 ) or (len(endDates) == 0) or (len(radars) == 0):
          print("One of the range/radar variables is empty and no CSV is specified.", flush = True)
          return 0
@@ -41,7 +44,8 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
       if timeThreshold < 0:
          print("Time threshold ({}) cannot be negative.".format(timeThreshold), flush = True)
          return 0
-      epochTime = useCSV(inputFile, radarName, timeStampName, dateFormat, timeThreshold)
+      epochTime = useCSV(inputFile,  radarName,  timeStampName, startTimeName, 
+                         endTimeName, dateFormat, timeThreshold)
    
    # Make sure there is input data
    if len(epochTime) == 0:
@@ -58,7 +62,7 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
    
    # Flatten and find unique entries in list
    prefixList = np.array(list(set([item for sublist in prefixList for item in sublist])))
-   
+      
    # Setup Anoymous Login for S3 with Amazon 
    noaas3 = boto3.client("s3", region_name = "us-east-1",
                          config = Config(signature_version = UNSIGNED))
@@ -68,7 +72,7 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
    objectsInBucket = np.array([noaas3.list_objects_v2(Bucket = "noaa-nexrad-level2",
                                                       Delimiter = '/', Prefix = prefix)
                                for prefix in tqdm(prefixList, file = sys.__stdout__)])
-   objectList = np.array([item["Contents"] for item in objectsInBucket if "Contents" in item])
+   objectList = np.array([item["Contents"] for item in objectsInBucket if "Contents" in item], dtype=object)
    # Make sure files are of the right format
    fileNames = np.array([file["Key"] for object in objectList
                          for file in object
@@ -85,17 +89,21 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
      
    radars = np.array([entry["radar"] for entry in fileInfo])
    
+   if printFileList:
+      print("Files:", flush = True)
+      for file in fileInfo: print(file, flush = True)
+   
    # Filtering out files outside of the time window
    print("Filtering files to download:", flush = True)
    filteredFiles = [info["name"] for epoch in tqdm(epochTime, file = sys.__stdout__)
                     for info in fileInfo[np.where(radars == epoch["radar"])[0]]
                     if (epoch["start"] <= info["time"] <= epoch["end"])] 
-   
+      
    filteredFiles.sort()
    
    filteredDates = list(set([file[file.rfind('/') + 5:file.rfind('/') + 13] + '/' + file[file.rfind('/') + 1:file.rfind('/') + 5] for file in filteredFiles]))
-
-   ## Make set of existing radar files in specified output directory for skipping downloading existing files
+      
+   # Make set of existing radar files in specified output directory for skipping downloading existing files
    print("Finding exisiting files:", flush = True)
    existingFiles = set([item[item.rfind('/') + 5:item.rfind('/') + 9] + '/' +
                         item[item.rfind('/') + 9:item.rfind('/') + 11] + '/' +
@@ -104,7 +112,7 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
                         item[item.rfind('/') + 1:]
                         for d in tqdm(filteredDates, file = sys.__stdout__)
                         for item in glob(outputDir + "/{}/raw/*".format(d))])
-     
+        
    # Filtering out files that are already in output directory
    filesToDownload = np.array(list(set(filteredFiles) - existingFiles))
    
@@ -134,6 +142,10 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
       noaas3.download_file("noaa-nexrad-level2", file,
                            outputDir + '/' + file[file.rfind('/') + 5:file.rfind('/') + 13] +
                            file[file.rfind('/'):file.rfind('/') + 5] + "/raw" + file[file.rfind('/'):])
+   
+   # Get NSE data for all new files
+   if copyST or copyNRE: pullNSE(outputDir, filteredFiles, copyST, copyNRE)
+   
    return 0
 
 def getRadarListFromDomain(domains, radarFile, latName, lonName, radarCol):
@@ -247,7 +259,7 @@ def validRadar(radar):
    else:
       return False
 
-def useCSV(file, radarName, timeStampName, dateFormat, timeThreshold):         
+def useCSV(file, radarName, timeStampName, startTimeName, endTimeName, dateFormat, timeThreshold):         
    # Read in CSV and store as a dataframe
    try:
       df = pd.read_csv(file, encoding = "ISO-8859-1", low_memory = False)
@@ -255,20 +267,30 @@ def useCSV(file, radarName, timeStampName, dateFormat, timeThreshold):
       print("Unable to read {}.".format(file, err), flush = True)
       exit()
    
-   if not radarName in df or not timeStampName in df:
-      print("\"{}\" or \"{}\" not valid column name in {}.".format(radarName, timeStampName, file), flush = True)
+   if not radarName in df or ((not timeStampName in df) and (not startTimeName in df or not endTimeName in df)) :
+      print("\"{}\" or \"{}\" and \"{}\" or \"{}\" not valid column name in {}.".format(radarName, timeStampName, startTimeName, endTimeName, file), flush = True)
       exit()      
-   
-   df = df.drop_duplicates([timeStampName])
-   
+      
+   if startTimeName in df and endTimeName in df:
+      df = df.drop_duplicates([startTimeName, endTimeName, radarName])
+   else:
+      df = df.drop_duplicates([timeStampName, radarName])
+
    radars = [[str(radar)] if ' ' not in str(radar) else str(radar).split() for radar in df[radarName]]
    
    # Get window aroud each CSV entry and which radar the time is associated with
-   epochTime = np.array([{"start" : timegm(time.strptime(stamp, dateFormat)) - timeThreshold,
-                          "end" : timegm(time.strptime(stamp, dateFormat)) + timeThreshold,
-                          "radar" : rad} for stamp, radar in zip(df[timeStampName], radars)
-                         for rad in radar if validRadar(rad) and validDate(stamp, dateFormat)])
-
+   if startTimeName in df and endTimeName in df:
+      epochTime = np.array([{"start" : timegm(time.strptime(s, dateFormat)),
+                             "end" : timegm(time.strptime(e, dateFormat)),
+                             "radar" : rad} for s, e, radar in zip(df[startTimeName], df[endTimeName], radars)
+                             for rad in radar if validRadar(rad) and validDate(s, dateFormat) and validDate(e, dateFormat)])  
+   else:
+      epochTime = np.array([{"start" : timegm(time.strptime(stamp, dateFormat)) - timeThreshold,
+                             "end" : timegm(time.strptime(stamp, dateFormat)) + timeThreshold,
+                             "radar" : rad} for stamp, radar in zip(df[timeStampName], radars)
+                             for rad in radar if validRadar(rad) and validDate(stamp, dateFormat)])
+   
+   print(epochTime)
    return epochTime
 
 def useRangeAndRadar(start, end, radars, dateFormat):
@@ -305,13 +327,157 @@ def useRangeAndRadar(start, end, radars, dateFormat):
                           if ((len(radar) != 0) and (len(first) != 0))
                           for rad in radar for s, e in zip(first, last)
                           if validDate(s, dateFormat) and validDate(e, dateFormat)])
-         
    return epochTime
+
+def pullNSE(directory, files, copyST, copyNRE):
+   
+   dateformat  = re.compile("\d{4}(0[1-9]|1[0-2])(0[1-9]|1[0-9]|2[0-9]|3[0-1])")
+   radarformat = re.compile("[K|P|T][A-Z]{3}")
+   
+   opaths = list(set(["{}/NSE/SoundingTable/{}/{}-{}*".format(re.search(dateformat, file).group(0),
+                                                              re.search(radarformat, file).group(0),
+                                                              re.search(dateformat, file).group(0),
+                                                              re.search("_(.+?)\d{4}_", file).group(1))
+                      for file in files]))
+   
+   opaths.sort()
+
+   paths = [p for p in opaths if not glob("{}/{}".format(directory, p))]
+   
+   print("Downloading NSE files:", flush = True)
+      
+   for p in tqdm(paths, file = sys.__stdout__):
+      indexs = False
+      indexr = False
+      
+      try:
+         yyyymmdd = re.search(dateformat, p).group(0)
+         radar    = re.search(radarformat, p).group(0)
+      except:
+         print("\nFormat not as expected: {}".format(p), flush = True)
+         continue
+         
+      if copyST:
+         if not path.exists("{}/{}/NSE/SoundingTable/{}".format(directory, yyyymmdd, radar)):
+            try:
+               system("mkdir -p {}/{}/NSE/SoundingTable/{} > /dev/null 2>&1".format(directory, yyyymmdd, radar))
+            except OSError as err:
+               print("\nError making directory: {}/{}/NSE/SoundingTable/{}\n{}\n".format(directory, yyyymmdd, radar, err), flush = True)
+               exit()
+         
+         try:
+            print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE/{} "
+                  "{}/{}/NSE/SoundingTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+            system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE/{} {}/{}/NSE/SoundingTable/{}/ "
+                   "> /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+            
+            indexs = True
+         except (KeyboardInterrupt):
+            break
+         except OSError as err:
+            print(err, flush = True)
+          
+         if not glob("{}/{}".format(directory, p)):
+            print("{}/{}".format(directory, p))
+            try:
+               print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                     "{}/{}/NSE/SoundingTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+               system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                      "{}/{}/NSE/SoundingTable/{}/ > /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+               
+               indexs = True
+            except (KeyboardInterrupt):
+               break
+            except OSError as err:
+               print(err, flush = True)
+            
+            if not glob("{}/{}".format(directory, p)):
+               try:
+                  p.replace("/NSE/SoundingTable", "/data6/NSE_Rebuild/NSE/SoundingTable")
+                  
+                  print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                        "{}/{}/NSE/SoundingTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+                  system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                         "{}/{}/NSE/SoundingTable/{}/ > /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+                  
+                  indexs = True
+               except (KeyboardInterrupt):
+                  break
+               except OSError as err:
+                  print(err, flush = True)
+                  print("\nCould not find any SoundingTable for: \n{}\n".format(p))
+               
+               if not glob("{}/{}".format(directory, p)):
+                  print("Could not find {} at hwtarchive.".format(p))
+                  indexs = False
+                        
+      # Near radar environment table
+      if copyNRE:
+         p.replace("/NSE/SoundingTable", "/NSE/NearRadarEnvironmentTable")
+         
+         if not path.exists("{}/{}/NSE/NearRadarEnvironmentTable/{}".format(directory, yyyymmdd, radar)):
+            try:
+               system("mkdir -p {}/{}/NSE/NearRadarEnvironmentTable/{} > /dev/null 2>&1".format(directory, yyyymmdd, radar))
+            except OSError as err:
+               print("\nError making directory: {}/{}/NSE/NearRadarEnvironmentTable/{}\n{}\n".format(directory, yyyymmdd, radar, err), flush = True)
+               exit()
+         
+         try:
+            print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE/{} "
+                  "{}/{}/NSE/NearRadarEnvironmentTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+            system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE/{} {}/{}/NSE/NearRadarEnvironmentTable/{}/ "
+                   "> /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+            
+            indexr = True
+         except (KeyboardInterrupt):
+            break
+         except OSError as err:
+            print(err, flush = True)
+          
+         if not glob("{}/{}".format(directory, p)):
+            print("{}/{}".format(directory, p))
+            try:
+               print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                     "{}/{}/NSE/NearRadarEnvironmentTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+               system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                      "{}/{}/NSE/NearRadarEnvironmentTable/{}/ > /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+               
+               indexr = True
+            except (KeyboardInterrupt):
+               break
+            except OSError as err:
+               print(err, flush = True)
+            
+            if not glob("{}/{}".format(directory, p)):
+               try:
+                  p.replace("/NSE/NearRadarEnvironmentTable", "/data6/NSE_Rebuild/NSE/NearRadarEnvironmentTable")
+                  
+                  print("\nrsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                        "{}/{}/NSE/NearRadarEnvironmentTable/{}/".format(p, directory, yyyymmdd, radar), flush = True)
+                  system("rsync -auq wdssii@hwtarchive.hwt.nssl:/data6/NSE_Rebuild/NSE_organized/{} "
+                         "{}/{}/NSE/NearRadarEnvironmentTable/{}/ > /dev/null 2>&1".format(p, directory, yyyymmdd, radar))
+
+                  
+                  indexr = True
+               except (KeyboardInterrupt):
+                  break
+               except OSError as err:
+                  print(err, flush = True)
+                  print("\nCould not find any NearRadarEnvironmentTable for: \n{}\n".format(p))
+               
+               if not glob("{}/{}".format(directory, p)):
+                  print("Could not find {} at hwtarchive.".format(p))
+                  indexr = False
+   
+      if indexs or indexr: system("makeIndex.pl {}/{}/NSE code_index.xml > /dev/null 2>&1".format(directory, yyyymmdd))
+ 
+   return 0
 
 if __name__ == "__main__":
    parser = argparse.ArgumentParser(description = "Downloads NEXRAD level II radar data "
-            "from Amazon within time threshold of csv entry or within date/radar lists. "
-            "To specify more than one case/radar by date/radar, add another optional argument to the command. "
+            "from Amazon within time threshold of csv entry or within date/radar lists, "
+            "and gets NSE data from hwtarchive if available. To specify more than one "
+            "case/radar by date/radar, add another optional argument to the command. "
             "Example: python downloadLevel2RadarData.py --ds 20130520-2012 20130520-2345 "
             "--ds 20130521-0530 --de 20130520-2030 20130520-2350 --de 20130521-0600 --rad KFDR "
             "--rad KTLX KVNX . Come ask me (Thea) if you're confused!")
@@ -330,12 +496,24 @@ if __name__ == "__main__":
                        help = "Path to csv with reports. This needs to have a column named "
                        "\"timestamp\" with format: \"YYYYmmdd-HHMM\" and one named \"radar\" "
                        "if you use the default settings.")
+   parser.add_argument("--ist", metavar = "startTimeName", type = str, nargs = '?',
+                       default = "startDate", help = "Column name for the radar from "
+                       "the CSV. Default = %(default)s.")
+   parser.add_argument("--iet", metavar = "endTimeName", type = str,  nargs = '?',
+                       default = "endDate", help = "Column name for the time stamp "
+                       "from the CSV. Default = %(default)s.")
    parser.add_argument("--ir", metavar = "radarName", type = str, nargs = '?',
                        default = "radar", help = "Column name for the radar from "
                        "the CSV. Default = %(default)s.")
    parser.add_argument("--it", metavar = "timeStampName", type = str,  nargs = '?',
                        default = "timestamp", help = "Column name for the time stamp "
                        "from the CSV. Default = %(default)s.")
+   parser.add_argument("--nst", metavar = "copyST", type = bool, nargs = '?', default = False,
+                       help = "If true, get NSE SoundingTable data from hwtarchive. "
+                       "Default = %(default)s")
+   parser.add_argument("--nre", metavar = "copyNRE", type = bool, nargs = '?', 
+                       default = False, help = "If true, get NSE near radar environment "
+                       "data from hwtarchive. Only works if -n is True. Default = %(default)s")
    parser.add_argument("-o", metavar = "outputDir", type = str,  nargs = '?', 
                        default = "temp", help = "Path to output directory. Default = %(default)s")
    parser.add_argument("-p", metavar = "printFileList", type = bool, nargs = '?', default = False,
@@ -365,7 +543,7 @@ if __name__ == "__main__":
    args = parser.parse_args(sys.argv[1:])
        
    main(outputDir = args.o, dateFormat = args.d, startDates = args.ds, endDates = args.de,
-        inputFile = args.i, printFileList = args.p, radars = args.rad, radarName = args.ir,
-        timeStampName = args.it, timeThreshold = args.t, domains = args.dom, radarFile = args.rf,
-        latName = args.rt, lonName = args.rn, radarCol = args.rr)
+        inputFile = args.i, copyST = args.nst, copyNRE = args.nre, printFileList = args.p,
+        radars = args.rad, startTimeName = args.ist, endTimeName = args.iet, radarName = args.ir, timeStampName = args.it, timeThreshold = args.t,
+        domains = args.dom, radarFile = args.rf, latName = args.rt, lonName = args.rn, radarCol = args.rr)
    
