@@ -13,8 +13,8 @@ from tqdm import tqdm
 
 def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDates = [],
          inputFile = '', copyST = False, copyNRE = False, printFileList = False,
-         radars = [], radarName = "radar", timeStampName = "timestamp",
-         startTimeName = "startDate", endTimeName = "endDate", timeThreshold = 300,
+         radars = [], radarName = "radar", radarSep = " ", timeStampName = "timestamp", domainName = "domain",
+         domainSep = ", ", startTimeName = "startDate", endTimeName = "endDate", timeThreshold = 300,
          domains = [], radarFile = '', latName = '', lonName = '', radarCol = ''):   
    if not path.exists(outputDir):
       print("Output directory {} does not exist. Creating directory.".format(outputDir), flush = True)
@@ -33,7 +33,7 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
          print("Radars in domain:")
          print(radars)
       if (len(startDates) == 0 ) or (len(endDates) == 0) or (len(radars) == 0):
-         print("One of the range/radar variables is empty and no CSV is specified.", flush = True)
+         print("One of the range/radar variables is empty and no input file is specified.", flush = True)
          return 0
       epochTime = useRangeAndRadar(startDates, endDates, radars, dateFormat)
    else:
@@ -44,8 +44,8 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
       if timeThreshold < 0:
          print("Time threshold ({}) cannot be negative.".format(timeThreshold), flush = True)
          return 0
-      epochTime = useCSV(inputFile,  radarName,  timeStampName, startTimeName, 
-                         endTimeName, dateFormat, timeThreshold)
+      epochTime = useCSV(inputFile, radarName, radarSep, domainName, domainSep, timeStampName, startTimeName, 
+                         endTimeName, dateFormat, timeThreshold, radarFile, latName, lonName, radarCol)
    
    # Make sure there is input data
    if len(epochTime) == 0:
@@ -92,7 +92,7 @@ def main(outputDir = "temp", dateFormat = "%Y%m%d-%H%M", startDates = [], endDat
    if printFileList:
       print("Files:", flush = True)
       for file in fileInfo: print(file, flush = True)
-   
+
    # Filtering out files outside of the time window
    print("Filtering files to download:", flush = True)
    filteredFiles = [info["name"] for epoch in tqdm(epochTime, file = sys.__stdout__)
@@ -259,25 +259,42 @@ def validRadar(radar):
    else:
       return False
 
-def useCSV(file, radarName, timeStampName, startTimeName, endTimeName, dateFormat, timeThreshold):         
+def useCSV(file, radarName, radarSep, domainName, domainSep, timeStampName, startTimeName, endTimeName,
+           dateFormat, timeThreshold, radarFile, latName, lonName, radarCol):         
    # Read in CSV and store as a dataframe
    try:
-      df = pd.read_csv(file, encoding = "ISO-8859-1", low_memory = False)
+      if ".csv" in file:
+         df = pd.read_csv(file, encoding = "ISO-8859-1", low_memory = False)
+      elif ".json" in file:
+         df = pd.read_json(file)
+      else:
+         print("Unrecognized file format: {}\nExiting.".format(file))
+         exit()
    except OSError as err:
       print("Unable to read {}.".format(file, err), flush = True)
-      exit()
-   
-   if not radarName in df or ((not timeStampName in df) and (not startTimeName in df or not endTimeName in df)) :
-      print("\"{}\" or \"{}\" and \"{}\" or \"{}\" not valid column name in {}.".format(radarName, timeStampName, startTimeName, endTimeName, file), flush = True)
       exit()      
-      
-   if startTimeName in df and endTimeName in df:
-      df = df.drop_duplicates([startTimeName, endTimeName, radarName])
-   else:
-      df = df.drop_duplicates([timeStampName, radarName])
-
-   radars = [[str(radar)] if ' ' not in str(radar) else str(radar).split() for radar in df[radarName]]
    
+   if (not radarName in df and not domainName in df) or ((not timeStampName in df) and (not startTimeName in df or not endTimeName in df)) :
+      print("\"{}\" and \"{}\" or \"{}\" and \"{}\" or \"{}\" not valid column name in {}.".format(radarName, domainName, timeStampName, startTimeName, endTimeName, file), flush = True)
+      exit()      
+   
+   raddom = domainName if domainName in df else radarName
+   
+   if ".csv" in file and startTimeName in df and endTimeName in df:
+      df = df.drop_duplicates([startTimeName, endTimeName, raddom])
+   elif ".csv" in file:
+      df = df.drop_duplicates([timeStampName, raddom])
+
+   if not radarName in df and domainName in df:
+      if not radarFile:
+         print("Need a list of NEXRAD radars with coordinate information to proceed. Please provide radar file path.")
+         exit()
+      if ".csv" in file:
+         radars = getRadarListFromDomain(df[domainName].apply(lambda x: [float(y) for y in x[1:-1].split(domainSep)]).values, radarFile, latName, lonName, radarCol)
+      else:
+         radars = getRadarListFromDomain(df[domainName], radarFile, latName, lonName, radarCol)
+   else:
+      radars = [[str(radar)] if radarSep not in str(radar) else str(radar).split(radarSep) for radar in df[radarName]]
    # Get window aroud each CSV entry and which radar the time is associated with
    if startTimeName in df and endTimeName in df:
       epochTime = np.array([{"start" : timegm(time.strptime(s, dateFormat)),
@@ -493,21 +510,30 @@ if __name__ == "__main__":
                        "defined like [upper lat] [lower lat] [left lon] [right lon]. "
                        "Example: --dom 40.5 39.8 -100 -98.4")
    parser.add_argument("-i", metavar = "inputFile", type = str, nargs = '?', default = '',
-                       help = "Path to csv with reports. This needs to have a column named "
-                       "\"timestamp\" with format: \"YYYYmmdd-HHMM\" and one named \"radar\" "
+                       help = "Path to csv/json with list of reports or events. This needs to have a column named "
+                       "\"timestamp\" with format: \"YYYYmmdd-HHMM\" and one named \"radar\" or \"domain\""
                        "if you use the default settings.")
    parser.add_argument("--ist", metavar = "startTimeName", type = str, nargs = '?',
                        default = "startDate", help = "Column name for the radar from "
-                       "the CSV. Default = %(default)s.")
+                       "the input file. Default = %(default)s.")
    parser.add_argument("--iet", metavar = "endTimeName", type = str,  nargs = '?',
                        default = "endDate", help = "Column name for the time stamp "
-                       "from the CSV. Default = %(default)s.")
+                       "from the input file. Default = %(default)s.")
    parser.add_argument("--ir", metavar = "radarName", type = str, nargs = '?',
                        default = "radar", help = "Column name for the radar from "
-                       "the CSV. Default = %(default)s.")
+                       "the input file. Default = %(default)s.")
+   parser.add_argument("--id", metavar = "domainName", type = str, nargs = '?',
+                       default = "domain", help = "Column name for the domain from "
+                       "the input file. Default = %(default)s.")
+   parser.add_argument("--ids", metavar = "domainSeparator", type = str, nargs = '?',
+                       default = ", ", help = "Separator for list of coordinates"
+                       "of the domains in the input file. Default = %(default)s.")
+   parser.add_argument("--irs", metavar = "radarSeparator", type = str, nargs = '?',
+                       default = " ", help = "Separator for list of radars in "
+                       "the input file. Default = %(default)s.")
    parser.add_argument("--it", metavar = "timeStampName", type = str,  nargs = '?',
                        default = "timestamp", help = "Column name for the time stamp "
-                       "from the CSV. Default = %(default)s.")
+                       "from the input file. Default = %(default)s.")
    parser.add_argument("--nst", metavar = "copyST", type = bool, nargs = '?', default = False,
                        help = "If true, get NSE SoundingTable data from hwtarchive. "
                        "Default = %(default)s")
@@ -544,6 +570,7 @@ if __name__ == "__main__":
        
    main(outputDir = args.o, dateFormat = args.d, startDates = args.ds, endDates = args.de,
         inputFile = args.i, copyST = args.nst, copyNRE = args.nre, printFileList = args.p,
-        radars = args.rad, startTimeName = args.ist, endTimeName = args.iet, radarName = args.ir, timeStampName = args.it, timeThreshold = args.t,
+        radars = args.rad, startTimeName = args.ist, endTimeName = args.iet,
+        radarName = args.ir, radarSep = args.irs, timeStampName = args.it, domainName = args.id, domainSep = args.ids, timeThreshold = args.t,
         domains = args.dom, radarFile = args.rf, latName = args.rt, lonName = args.rn, radarCol = args.rr)
    
